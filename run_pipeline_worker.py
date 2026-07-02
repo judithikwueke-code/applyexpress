@@ -1,0 +1,409 @@
+"""
+Standalone pipeline worker — runs as a detached subprocess so it survives gunicorn restarts.
+
+Usage (called by app.py):
+    python3 tools/run_pipeline_worker.py <user_id> <run_db_id> <db_path> <root_path> [specialty_id]
+"""
+
+import sys, os, json, time, re, logging
+from pathlib import Path
+from datetime import datetime
+
+def _dec(ciphertext: str) -> str:
+    """Decrypt a Fernet-encrypted credential. Falls back to plaintext if key missing."""
+    if not ciphertext:
+        return ""
+    try:
+        from cryptography.fernet import Fernet
+        key = os.getenv("CREDENTIAL_KEY", "").encode()
+        if not key:
+            return ciphertext
+        if not ciphertext.startswith("gAAAAA"):
+            return ciphertext  # plaintext (pre-migration)
+        return Fernet(key).decrypt(ciphertext.encode()).decode()
+    except Exception:
+        return ""
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [pipeline] %(message)s")
+log = logging.getLogger(__name__)
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: run_pipeline_worker.py <user_id> <run_db_id> <db_path> <root_path> [specialty_id]")
+        sys.exit(1)
+
+    user_id      = int(sys.argv[1])
+    run_db_id    = int(sys.argv[2])
+    db_path      = sys.argv[3]
+    root_path    = sys.argv[4]
+    specialty_id = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+
+    # Add project root to path so tools/ imports work
+    sys.path.insert(0, root_path)
+    os.chdir(root_path)
+
+    # Load root .env for LLM keys
+    from dotenv import load_dotenv
+    load_dotenv(Path(root_path) / ".env")
+
+    import sqlite3
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
+    def update(**kw):
+        sets = ", ".join(f"{k}=?" for k in kw)
+        vals = list(kw.values()) + [run_db_id]
+        conn.execute(f"UPDATE runs SET {sets} WHERE id=?", vals)
+        conn.commit()
+
+    def user_dir(uid):
+        d = Path(db_path).parent / "users" / str(uid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".tmp").mkdir(exist_ok=True)
+        return d
+
+    try:
+        u = dict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
+        udir   = user_dir(user_id)
+        tmpdir = udir / ".tmp"
+
+        # Resolve specialty paths if a specialty was selected
+        if specialty_id:
+            spec = conn.execute("SELECT * FROM specialties WHERE id=?", (specialty_id,)).fetchone()
+            if spec:
+                spec = dict(spec)
+                sdir             = udir / "specialties" / spec["slug"]
+                cv_path_use      = str(sdir / "cv.docx")
+                profile_path_use = str(sdir / "profile.md")
+                keywords_use     = spec["keywords"] or u["keywords"]
+                location_use     = spec["search_location"] or u["search_location"]
+                threshold_use    = spec["threshold"]
+                log.info(f"Running with specialty: {spec['name']} (slug={spec['slug']})")
+            else:
+                specialty_id = None  # fallback to default if specialty not found
+
+        if not specialty_id:
+            cv_path_use      = str(udir / "cv.docx")
+            profile_path_use = str(udir / "candidate_profile.md")
+            keywords_use     = u["keywords"]
+            location_use     = u["search_location"]
+            threshold_use    = u["threshold"]
+            log.info("Running with default CV and profile")
+
+        # Patch environment for tools
+        os.environ.update({k: v or "" for k, v in {
+            "CANDIDATE_FIRST_NAME": u["first_name"],
+            "CANDIDATE_LAST_NAME":  u["last_name"],
+            "CANDIDATE_EMAIL":      u["email"],
+            "CANDIDATE_PHONE":      u.get("phone", ""),
+            "CV_PATH":              cv_path_use,
+            "TMP_DIR":              str(tmpdir),
+            "CANDIDATE_PROFILE_PATH": profile_path_use,
+            "JOB_SEARCH_KEYWORDS":  keywords_use,
+            "JOB_SEARCH_LOCATION":  location_use,
+            "SCORE_THRESHOLD":      str(threshold_use),
+            "EMAIL_SUBJECT_PREFIX": u.get("email_subject") or "Job Application",
+            "SMTP_EMAIL":           u["email"],
+            "SMTP_PASSWORD":        _dec(u.get("smtp_password", "")),
+            "SMTP_TO":              u["email"],
+            "LINKEDIN_EMAIL":       u.get("linkedin_email") or u["email"],
+            "LINKEDIN_PASSWORD":    _dec(u.get("linkedin_pass", "")),
+            "REED_EMAIL":           u.get("reed_email") or u["email"],
+            "REED_PASSWORD":        _dec(u.get("reed_pass", "")),
+            "INDEED_EMAIL":         u.get("indeed_email") or u["email"],
+            "INDEED_PASSWORD":      _dec(u.get("indeed_pass", "")),
+            "TWOCAPTCHA_API_KEY":   u.get("twocaptcha_key", ""),
+        }.items()})
+
+        # Write profile if missing
+        profile_path = Path(profile_path_use)
+        if not profile_path.exists():
+            profile_path.write_text(f"""## Personal Info
+- Name: {u['first_name']} {u['last_name']}
+- Email: {u['email']}
+- Phone: {u.get('phone') or ''}
+- Location: {u.get('location') or 'United Kingdom'}
+
+## Target Roles
+- Job titles: {keywords_use}
+- Work arrangement: Hybrid
+- Right to work in UK: Yes
+
+## Career Goals
+- Seeking: {keywords_use}
+- Location: {location_use}
+""")
+
+        run_id = conn.execute("SELECT run_id FROM runs WHERE id=?", (run_db_id,)).fetchone()["run_id"]
+        log.info(f"Pipeline started: user={user_id} run={run_id}")
+
+        # ── 1. Fetch ──────────────────────────────────────────────────────────
+        update(status="running", jobs_found=0)
+        from tools.fetch_jobs import fetch_all_jobs
+        jobs_raw = fetch_all_jobs(keywords_use, location_use,
+                                  int(os.getenv("JOB_SEARCH_COUNT", "15")))
+        (tmpdir / "jobs_raw.json").write_text(json.dumps(jobs_raw, indent=2))
+        update(status="running", jobs_found=len(jobs_raw))
+        log.info(f"Fetched {len(jobs_raw)} jobs")
+
+        # Only skip jobs that were SUCCESSFULLY applied — "Needs Review" jobs should be retried
+        applied_urls = set(
+            r[0] for r in conn.execute(
+                "SELECT url FROM applications WHERE user_id=? AND url != '' AND status='applied'",
+                (user_id,)
+            ).fetchall()
+        )
+        jobs_raw = [j for j in jobs_raw if j.get("url", "") not in applied_urls]
+        if not jobs_raw:
+            update(status="completed", finished_at=datetime.utcnow().isoformat(),
+                   jobs_applied=0, report_json='{"jobs":[],"note":"all jobs already applied"}')
+            conn.close()
+            log.info("All fetched jobs already applied this run — no new jobs")
+            return
+        log.info(f"After duplicate filter: {len(jobs_raw)} new jobs to score")
+
+        # ── 2. Score ──────────────────────────────────────────────────────────
+        from tools.score_job import score_job
+        profile_text = profile_path.read_text()[:1500]   # cap to keep Groq tokens low
+        threshold    = threshold_use
+        # Score all new jobs — Groq free tier: ~30 req/min, 2s gap = safe pace.
+        jobs_to_score = jobs_raw[:50]
+        if len(jobs_raw) > 50:
+            log.info(f"Capping scoring at 50 of {len(jobs_raw)} fetched jobs")
+        scored = []
+        for job in jobs_to_score:
+            try:
+                result = score_job(job, profile_text)
+                job["score"] = result.get("score", 0)
+                job["score_reason"] = result.get("reason", "")
+            except Exception as e:
+                job["score"] = 0
+                job["score_reason"] = str(e)
+            scored.append(job)
+            time.sleep(2)   # 2s between calls keeps us under Groq TPM
+
+        (tmpdir / "jobs_scored.json").write_text(json.dumps(scored, indent=2))
+        qualifying = [j for j in scored if j["score"] >= threshold]
+        qualifying = sorted(qualifying, key=lambda j: j["score"], reverse=True)[:15]
+        log.info(f"Qualifying jobs: {len(qualifying)} (threshold={threshold})")
+
+        if not qualifying:
+            update(status="completed", finished_at=datetime.utcnow().isoformat(),
+                   jobs_applied=0, report_json=json.dumps({"jobs": [], "run_id": run_id}))
+            conn.close()
+            log.info("No qualifying jobs — pipeline complete")
+            return
+
+        # ── 3. Tailor CV + cover letter ───────────────────────────────────────
+        from tools.tailor_cv_docx        import tailor_cv_docx
+        from tools.generate_cv_pdf       import generate_cv_pdf
+        from tools.generate_cover_letter import generate_cover_letter
+
+        def _slug(t, n=22):
+            return re.sub(r"[^\w]", "_", t.lower())[:n].strip("_")
+
+        report = {"run_id": run_id, "keywords": u["keywords"],
+                  "location": u["search_location"], "threshold": threshold, "jobs": []}
+
+        for job in qualifying:
+            title   = job.get("title", "Unknown")
+            company = job.get("company", "Unknown")
+            desc    = job.get("description", "")
+            log.info(f"Processing: {title} @ {company}")
+
+            record = {
+                "title": title, "company": company,
+                "url": job.get("url", ""), "source": job.get("source", ""),
+                "score": job.get("score", 0),
+                "cv_docx": None, "cv_pdf": None, "cover_letter_path": None,
+                "status": "needs_review", "ats": "unknown", "notes": "",
+            }
+
+            cv_out = str(tmpdir / f"cv_{_slug(company)}_{_slug(title)}.docx")
+            try:
+                tailor_cv_docx(title, company, desc, cv_out)
+                record["cv_docx"] = cv_out
+            except Exception as e:
+                record["cv_docx"] = str(udir / "cv.docx")
+                record["notes"] += f"CV tailor error: {e}. "
+
+            if record["cv_docx"]:
+                pdf_out = record["cv_docx"].replace(".docx", ".pdf")
+                try:
+                    generate_cv_pdf(record["cv_docx"], pdf_out)
+                    record["cv_pdf"] = pdf_out
+                except Exception as e:
+                    record["notes"] += f"PDF error: {e}. "
+
+            time.sleep(2)
+            cl_out = str(tmpdir / f"cl_{_slug(company)}_{_slug(title)}.txt")
+            try:
+                cover_letter = generate_cover_letter(job, profile_text)
+                Path(cl_out).write_text(cover_letter)
+                record["cover_letter_path"] = cl_out
+            except Exception as e:
+                record["notes"] += f"Cover letter error: {e}. "
+
+            report["jobs"].append(record)
+            time.sleep(2)
+
+        # ── 4. Submit applications server-side via Playwright (headless) ─────────
+        import subprocess as _sp
+
+        def _route_apply(job_url: str) -> list:
+            """Return the Node script and extra args for this job URL."""
+            u_lower = job_url.lower()
+            if "greenhouse.io" in u_lower:
+                return ["node", "tools/apply_greenhouse_playwright.js"]
+            if "lever.co" in u_lower:
+                return ["node", "tools/apply_lever_playwright.js"]
+            if "reed.co.uk" in u_lower:
+                return ["node", "tools/apply_reed_playwright.js"]
+            if "indeed" in u_lower:
+                return ["node", "tools/apply_indeed.js"]
+            if "linkedin.com" in u_lower:
+                return ["node", "tools/apply_linkedin.js"]
+            if "workable.com" in u_lower or "ashbyhq.com" in u_lower or "totaljobs.com" in u_lower:
+                return ["node", "tools/apply_job.js"]
+            return None  # unsupported — mark needs_review
+
+        # Session cookie files per platform (uploaded via dashboard)
+        sessions_dir = Path(db_path).parent / "users" / str(user_id) / "sessions"
+        def _cookies_path(platform: str) -> str:
+            p = sessions_dir / f"{platform}.json"
+            return str(p) if p.exists() else ""
+
+        applied_count = 0
+        for record in report["jobs"]:
+            job_url      = record.get("url", "")
+            cv_path      = record.get("cv_pdf") or record.get("cv_docx") or cv_path_use
+            cl_path      = record.get("cover_letter_path", "")
+            cover_text   = Path(cl_path).read_text() if cl_path and Path(cl_path).exists() else ""
+            title        = record.get("title", "")
+            company      = record.get("company", "")
+
+            # Skip if already applied to this URL in a previous run
+            if job_url:
+                already = conn.execute(
+                    "SELECT id FROM applications WHERE user_id=? AND url=? AND run_db_id != ?",
+                    (user_id, job_url, run_db_id)).fetchone()
+                if already:
+                    log.info("Skipping duplicate (already applied): %s @ %s", title, company)
+                    record["notes"] += "Already applied in a previous run. "
+                    record["status"] = "skipped"
+                    continue
+
+            cmd_base = _route_apply(job_url)
+            if not cmd_base:
+                record["notes"] += "Unsupported ATS — needs manual apply. "
+                log.info("Skipping unsupported URL: %s", job_url)
+                continue
+
+            # Resolve session cookies file for this platform
+            u_lower = job_url.lower()
+            if "reed.co.uk" in u_lower:
+                cookies_file = _cookies_path("reed")
+            elif "indeed" in u_lower:
+                cookies_file = _cookies_path("indeed")
+            elif "linkedin.com" in u_lower:
+                cookies_file = _cookies_path("linkedin")
+            else:
+                cookies_file = ""
+
+            cmd = cmd_base + [
+                "--url",          job_url,
+                "--cv-path",      cv_path,
+                "--cover-letter", cover_text,
+                "--first-name",   u["first_name"],
+                "--last-name",    u["last_name"],
+                "--email",        u["email"],
+                "--phone",        u.get("phone", ""),
+                "--job-title",    title,
+                "--company",      company,
+            ]
+            if cookies_file:
+                cmd += ["--cookies-path", cookies_file]
+                log.info(f"Using session cookies: {cookies_file}")
+
+            log.info(f"Submitting [{record.get('source','?')}]: {title} @ {company}")
+            try:
+                result = _sp.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=300, cwd=root_path,
+                )
+                stdout = result.stdout.strip()[-500:]
+                stderr = result.stderr.strip()[-300:]
+                code   = result.returncode
+
+                if code == 0:
+                    record["status"] = "applied"
+                    applied_count += 1
+                    log.info(f"Applied: {title} @ {company}")
+                elif code == 2:
+                    record["status"] = "needs_review"
+                    record["notes"] += "External ATS redirect — needs manual apply. "
+                    log.info(f"External ATS redirect: {title} @ {company}")
+                elif code == 3:
+                    record["status"] = "needs_review"
+                    record["notes"] += "CAPTCHA blocked — needs manual apply. "
+                    log.info(f"CAPTCHA blocked: {title} @ {company}")
+                else:
+                    record["status"] = "needs_review"
+                    record["notes"] += f"Apply failed (exit {code}): {stderr[-150:]}. "
+                    log.warning(f"Apply failed exit={code}: {title} @ {company} | {stderr[-150:]}")
+
+            except _sp.TimeoutExpired:
+                record["status"] = "needs_review"
+                record["notes"] += "Apply timed out after 5 min. "
+                log.warning(f"Apply timed out: {title} @ {company}")
+            except Exception as e:
+                record["status"] = "needs_review"
+                record["notes"] += f"Apply error: {e}. "
+                log.warning(f"Apply error: {title} @ {company}: {e}")
+
+            # Save to applications table (so History page reflects server-side runs)
+            final_status = record.get('status', 'needs_review')
+            db_status = 'applied' if final_status == 'applied' else 'failed'
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO applications
+                       (user_id, run_db_id, title, company, url, status, notes, applied_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (user_id, run_db_id, title, company, job_url, db_status,
+                     record.get('notes', '')[:500], datetime.utcnow().isoformat()))
+                conn.commit()
+            except Exception as db_err:
+                log.warning(f"DB insert failed for {title}: {db_err}")
+
+            time.sleep(3)
+
+        # ── 5. Save report and email ──────────────────────────────────────────
+        report_path = tmpdir / f"application_report_{run_id}.json"
+        report_path.write_text(json.dumps(report, indent=2))
+
+        if _dec(u.get("smtp_password", "")):
+            try:
+                from tools.send_application_report import send_report
+                send_report(report)
+                log.info(f"Report emailed to {u['email']}")
+            except Exception as e:
+                log.warning(f"Email failed: {e}")
+
+        update(status="completed", finished_at=datetime.utcnow().isoformat(),
+               jobs_applied=applied_count,
+               report_json=report_path.read_text())
+        log.info(f"Pipeline complete: {applied_count} applied, "
+                 f"{len(report['jobs']) - applied_count} needs review")
+
+    except Exception as e:
+        log.error(f"Pipeline failed for user {user_id}: {e}", exc_info=True)
+        try:
+            update(status="failed", finished_at=datetime.utcnow().isoformat())
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

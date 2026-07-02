@@ -1,0 +1,40 @@
+# fly.toml — AutoApply SaaS on Fly.io free tier
+#
+# First-time setup (run once):
+#   fly apps create autoapply            # pick a unique name
+#   fly volumes create autoapply_data --region lhr --size 1
+#   fly secrets set SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+#   fly secrets set GROQ_API_KEY=<your key>
+#   fly secrets set ANTHROPIC_API_KEY=<your key>   # optional
+#
+# Deploy:
+#   fly deploy
+#
+# Open:
+#   fly open
+
+app            = "autoapply"   # ← change to your unique Fly.io app name
+primary_region = "lhr"         # London — lowest latency for UK job boards
+
+[build]
+
+[env]
+  PORT     = "8080"
+  DATA_DIR = "/data"
+
+[http_service]
+  internal_port        = 8080
+  force_https          = true
+  auto_stop_machines   = true   # sleep when idle → stays on free tier
+  auto_start_machines  = true   # wake on first request
+  min_machines_running = 0
+
+[[mounts]]
+  source      = "autoapply_data"   # persistent volume (created above)
+  destination = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1
