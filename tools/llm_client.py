@@ -104,11 +104,17 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> str
         except RuntimeError as e:
             if "credits exhausted" in str(e):
                 _gemini_credits_exhausted = True
-                logger.warning("Gemini prepaid credits exhausted — skipping for remainder of process")
+                logger.warning("Gemini prepaid credits exhausted — falling back to Anthropic")
             else:
                 raise
 
-    raise RuntimeError("No LLM available: all Groq accounts and Gemini exhausted.")
+    # Fallback 4: Anthropic (paid, Haiku) — last resort so the pipeline never
+    # silently scores every job 0 when the free tiers are exhausted.
+    if ANTHROPIC_API_KEY:
+        logger.warning("Free-tier LLMs exhausted — using Anthropic fallback")
+        return _call_anthropic(system_prompt, user_prompt, max_tokens)
+
+    raise RuntimeError("No LLM available: all Groq accounts, Gemini, and Anthropic exhausted.")
 
 
 def _call_groq(system_prompt: str, user_prompt: str, max_tokens: int, api_key: str = None) -> str:

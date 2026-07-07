@@ -61,6 +61,12 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Enable once the site is served over HTTPS (Cloudflare/TLS): COOKIE_SECURE=1 in .env.production
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+)
 
 # ── Credential encryption (Fernet symmetric) ──────────────────────────────────
 # Job-board passwords are encrypted at rest in the DB.
@@ -249,7 +255,23 @@ def init_db():
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def _hash(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Salted PBKDF2 hash for new/updated passwords."""
+    from werkzeug.security import generate_password_hash
+    return generate_password_hash(password)
+
+def _verify_password(stored_hash: str, password: str) -> bool:
+    """Verify against PBKDF2, falling back to legacy unsalted SHA-256."""
+    if not stored_hash:
+        return False
+    if ":" in stored_hash or stored_hash.startswith(("pbkdf2", "scrypt")):
+        from werkzeug.security import check_password_hash
+        try:
+            return check_password_hash(stored_hash, password)
+        except Exception:
+            return False
+    # Legacy unsalted SHA-256 (pre-launch accounts)
+    return secrets.compare_digest(stored_hash,
+                                  hashlib.sha256(password.encode()).hexdigest())
 
 def _user_dir(user_id: int) -> Path:
     d = DATA_DIR / "users" / str(user_id)
@@ -313,14 +335,19 @@ def current_user():
 
 def _is_active(u: dict) -> bool:
     """Return True if user has an active paid plan or is within the 14-day trial."""
-    return True  # pricing not enforced yet
+    if u.get("is_paid"):
+        return True
+    trial_ends = u.get("trial_ends_at") or ""
+    return bool(trial_ends) and trial_ends > datetime.utcnow().isoformat()
 
 def paid_required(f):
-    """Placeholder — pricing not enforced yet, passes through."""
+    """Require an active subscription or unexpired trial."""
     @wraps(f)
     def decorated(*args, **kwargs):
         u = current_user()
-        if not u:
+        if not u or not _is_active(u):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Subscription required", "upgrade": "/pricing"}), 402
             return redirect(url_for("pricing") + "?gate=1")
         return f(*args, **kwargs)
     return decorated
@@ -1127,9 +1154,13 @@ def login_page():
         email = request.form.get("email", "").strip().lower()
         pwd   = request.form.get("password", "")
         db    = get_db()
-        row   = db.execute("SELECT * FROM users WHERE email=? AND password_hash=?",
-                           (email, _hash(pwd))).fetchone()
-        if row:
+        row   = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if row and _verify_password(row["password_hash"], pwd):
+            # Transparently upgrade legacy SHA-256 hashes to salted PBKDF2
+            if not (":" in row["password_hash"] or row["password_hash"].startswith(("pbkdf2", "scrypt"))):
+                db.execute("UPDATE users SET password_hash=? WHERE id=?",
+                           (_hash(pwd), row["id"]))
+                db.commit()
             session["user_id"] = row["id"]
             return redirect(url_for("dashboard"))
         error = "Invalid email or password."

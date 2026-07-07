@@ -25,10 +25,13 @@ db = sqlite3.connect(str(DB_PATH))
 db.row_factory = sqlite3.Row
 
 users = db.execute(
-    "SELECT id FROM users WHERE keywords IS NOT NULL AND keywords != ''"
+    """SELECT id FROM users
+       WHERE keywords IS NOT NULL AND keywords != ''
+         AND (is_paid = 1 OR (trial_ends_at != '' AND trial_ends_at > ?))""",
+    (datetime.utcnow().isoformat(),)
 ).fetchall()
 
-log.info(f"Firing pipeline for {len(users)} user(s) in parallel")
+log.info(f"Firing pipeline for {len(users)} active (paid/trial) user(s) in parallel")
 
 seq_runner = ROOT / "tools" / "run_sequential_runner.py"
 

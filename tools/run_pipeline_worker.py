@@ -7,7 +7,7 @@ Usage (called by app.py):
 
 import sys, os, json, time, re, logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 def _dec(ciphertext: str) -> str:
     """Decrypt a Fernet-encrypted credential. Falls back to plaintext if key missing."""
@@ -186,17 +186,54 @@ def main():
         jobs_to_score = jobs_raw[:50]
         if len(jobs_raw) > 50:
             log.info(f"Capping scoring at 50 of {len(jobs_raw)} fetched jobs (interleaved by source)")
+
+        # Score cache — the same jobs come back from the boards run after run,
+        # and re-scoring them burns the daily LLM budget (the #1 cause of runs
+        # ending with 0 applies). Cache per user+specialty for 7 days.
+        conn.execute("""CREATE TABLE IF NOT EXISTS job_scores (
+            user_id      INTEGER NOT NULL,
+            specialty_id TEXT    NOT NULL DEFAULT '',
+            url          TEXT    NOT NULL,
+            score        INTEGER NOT NULL,
+            reason       TEXT    DEFAULT '',
+            scored_at    TEXT    NOT NULL,
+            PRIMARY KEY (user_id, specialty_id, url)
+        )""")
+        conn.commit()
+        _spec_key = str(specialty_id or "")
+        _cache_cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+
         scored = []
+        _cache_hits = 0
         for job in jobs_to_score:
+            _url = job.get("url", "")
+            cached = conn.execute(
+                "SELECT score, reason FROM job_scores WHERE user_id=? AND specialty_id=? AND url=? AND scored_at > ?",
+                (user_id, _spec_key, _url, _cache_cutoff)).fetchone() if _url else None
+            if cached:
+                job["score"] = cached["score"]
+                job["score_reason"] = cached["reason"]
+                _cache_hits += 1
+                scored.append(job)
+                continue
             try:
                 result = score_job(job, profile_text)
                 job["score"] = result.get("score", 0)
                 job["score_reason"] = result.get("reason", "")
+                if _url:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO job_scores (user_id, specialty_id, url, score, reason, scored_at) VALUES (?,?,?,?,?,?)",
+                        (user_id, _spec_key, _url, job["score"], job["score_reason"][:300],
+                         datetime.utcnow().isoformat()))
+                    conn.commit()
             except Exception as e:
+                # Do NOT cache failures — scoring must be retried when the LLM recovers
                 job["score"] = 0
                 job["score_reason"] = str(e)
             scored.append(job)
             time.sleep(2)   # 2s between calls keeps us under Groq TPM
+        if _cache_hits:
+            log.info(f"Score cache: {_cache_hits}/{len(jobs_to_score)} jobs served from cache")
 
         (tmpdir / "jobs_scored.json").write_text(json.dumps(scored, indent=2))
         qualifying = [j for j in scored if j["score"] >= threshold]
@@ -536,6 +573,51 @@ Tailored CVs and cover letters are attached. Apply manually using the links belo
                 log.warning(f"DB insert failed for {title}: {db_err}")
 
             time.sleep(3)
+
+        # ── Detect expired job-board sessions and alert the user (once/day) ──
+        _login_markers = ("still on login page", "login_blocked", "auto-login failed",
+                          "no saved session", "login page", "captcha detected")
+        _dead_platforms = set()
+        for record in report["jobs"]:
+            n = (record.get("notes") or "").lower()
+            if any(m in n for m in _login_markers):
+                src = (record.get("source") or "").lower()
+                u_lower = (record.get("url") or "").lower()
+                if "reed" in src or "reed.co.uk" in u_lower:
+                    _dead_platforms.add("Reed")
+                elif "linkedin" in src or "linkedin.com" in u_lower:
+                    _dead_platforms.add("LinkedIn")
+                elif "indeed" in src or "indeed" in u_lower:
+                    _dead_platforms.add("Indeed")
+        if _dead_platforms:
+            _flag = tmpdir / f"session_alert_{datetime.utcnow().strftime('%Y%m%d')}.flag"
+            _smtp_pw = _dec(u.get("smtp_password", ""))
+            if not _flag.exists() and _smtp_pw:
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+                    plats = ", ".join(sorted(_dead_platforms))
+                    body = (f"Hi {u['first_name']},\n\n"
+                            f"ApplyExpress could not log in to: {plats}.\n"
+                            f"Your saved session has expired, so applications on "
+                            f"{'these platforms' if len(_dead_platforms) > 1 else 'this platform'} are failing.\n\n"
+                            f"To fix it: log in to {plats} in Chrome, then use the ApplyExpress "
+                            f"extension (or dashboard > Sessions) to re-upload your session.\n\n"
+                            f"— ApplyExpress")
+                    msg = MIMEText(body)
+                    msg["Subject"] = f"Action needed: {plats} session expired — applications are failing"
+                    msg["From"] = u["email"]
+                    msg["To"] = u["email"]
+                    with smtplib.SMTP("smtp.gmail.com", 587) as srv:
+                        srv.starttls()
+                        srv.login(u["email"], _smtp_pw)
+                        srv.sendmail(u["email"], u["email"], msg.as_string())
+                    _flag.write_text(plats)
+                    log.info(f"Session-expired alert emailed for: {plats}")
+                except Exception as mail_err:
+                    log.warning(f"Session-expired alert failed: {mail_err}")
+            else:
+                log.info(f"Expired sessions detected ({', '.join(sorted(_dead_platforms))}) — alert already sent today or SMTP unset")
 
         # ── Send batched sponsor digest (one email per pipeline run) ──────────
         if sponsor_matches:

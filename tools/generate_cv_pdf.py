@@ -55,6 +55,7 @@ def _safe(text: str) -> str:
         "\u2026": "...", # ellipsis
         "\u00a0": " ",   # non-breaking space
         "\u00b7": "-",   # middle dot
+        "\t":     "  |  ",  # tab (role-header date separator) \u2014 render as ATS-friendly pipe
     }
     for src, dst in replacements.items():
         text = text.replace(src, dst)
@@ -158,6 +159,10 @@ def generate_cv_pdf(input_path: str, output_path: str = None) -> str:
             pdf.set_text_color(0, 0, 0)
 
         elif t == "body":
+            # multi_cell leaves the cursor at the cell's right edge (new_x=RIGHT
+            # default), so always reset to the left margin before printing —
+            # otherwise any body line following a bullet is clipped off-page.
+            pdf.set_x(x_left)
             pdf.set_font("Helvetica", "", FONT_BODY)
             pdf.set_text_color(30, 30, 30)
             pdf.multi_cell(CONTENT_WIDTH, LINE_HEIGHT, text)
@@ -167,7 +172,8 @@ def generate_cv_pdf(input_path: str, output_path: str = None) -> str:
             pdf.set_font("Helvetica", "", FONT_BULLET)
             pdf.set_text_color(30, 30, 30)
             pdf.set_x(x_left + 3)
-            pdf.multi_cell(CONTENT_WIDTH - 3, LINE_HEIGHT, f"*  {text}")
+            pdf.multi_cell(CONTENT_WIDTH - 3, LINE_HEIGHT, f"*  {text}",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.output(output_path)
     logger.info(f"PDF saved: {output_path}")
