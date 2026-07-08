@@ -164,7 +164,7 @@ ABOUT THE EMPLOYER AT THIS ROLE ({role_company}):
 
 RULES:
 1. Keep EXACTLY the same number of bullets as the original.
-2. REFRAME AGGRESSIVELY — each bullet should use the target job's exact terminology and priorities. The factual basis (what actually happened) must remain true, but the framing, language, and emphasis should be fully aligned to this role. A hiring manager should read this and think "this person has done exactly what we need."
+2. Reframe honestly — emphasise the parts of each bullet most relevant to the target job, using the job's terminology where the candidate's experience genuinely matches. The factual basis (what actually happened, where, at what level) must remain exactly true. Do not upgrade the seniority, scope, or regulatory status of the work.
 3. Pull language DIRECTLY from the job description where the candidate's experience genuinely maps to it. ATS systems score on exact phrase matches — use the JD's vocabulary, not generic synonyms.
 4. Every bullet must start with a strong action verb (Led, Managed, Delivered, Conducted, Developed, Ensured, Implemented, Oversaw, Directed, Drove, Spearheaded).
 5. BANNED openers: "Responsible for", "Assisted with", "Supported", "Involved in", "Helped to", "Worked on".
@@ -502,8 +502,12 @@ def tailor_cv_docx(title: str, company: str, description: str, output_path: str 
 
     data = _parse_cv(doc_base)
 
-    # Professional title under name — derived from target role
-    data["professional_title"] = title
+    # Professional title under name — the candidate's REAL current title.
+    # Never the target job title: claiming the advertised title as your own
+    # reads as fabrication (fatal in compliance/regulated hiring).
+    data["professional_title"] = (data["roles"][0]["title"]
+                                  if data.get("roles") and data["roles"][0].get("title")
+                                  else "")
 
     # ── 1. Professional Summary ────────────────────────────────────────────────
     try:
@@ -557,20 +561,10 @@ def tailor_cv_docx(title: str, company: str, description: str, output_path: str 
         emp_ctx = _get_employer_context(role_company, employer_context_map)
         ctx_block = emp_ctx if emp_ctx else "No special constraints — standard tailoring applies."
 
-        # 4. Role title
-        try:
-            new_title = call_llm(_SYS, _ROLE_TITLE_PROMPT.format(
-                title=title, company=company,
-                current_header=f"{role['title']} | {role['org']} | {role['dates']}",
-                role_company=role_company,
-                employer_context=ctx_block,
-            ), max_tokens=30).strip().strip('"\'')
-            if new_title:
-                logger.info(f"Role {i+1} title: '{role['title']}' → '{new_title}'")
-                role["title"] = new_title
-            time.sleep(1)
-        except Exception as e:
-            logger.warning(f"Role {i+1} title rewrite failed: {e}")
+        # 4. Role title — NOT rewritten. Employer names, dates, and job titles
+        # are the three facts UK financial-services background checks verify;
+        # a title that fails referencing kills the offer. Tailoring lives in
+        # the summary, skills ordering, and bullet emphasis only.
 
         # 5. Bullets
         try:
