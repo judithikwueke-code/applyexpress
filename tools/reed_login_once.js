@@ -6,11 +6,13 @@ chromium.use(stealth());
 const path = require('path');
 const fs = require('fs');
 
-const TMP_DIR = process.env.TMP_DIR || '/opt/applyexpress/data/users/1/.tmp';
+const TMP_DIR = process.env.TMP_DIR;
+if (!TMP_DIR) { console.error('TMP_DIR env var is required'); process.exit(1); }
 const SESSION_DIR = path.join(TMP_DIR, 'reed_session');
 const SESSIONS_FILE = path.join(path.dirname(TMP_DIR), 'sessions', 'reed.json');
-const EMAIL = process.env.REED_EMAIL || 'jntonys@gmail.com';
-const PASSWORD = process.env.REED_PASSWORD || 'Okenwa22##';
+const EMAIL = process.env.REED_EMAIL || '';
+const PASSWORD = process.env.REED_PASSWORD || '';
+if (!EMAIL || !PASSWORD) { console.error('REED_EMAIL and REED_PASSWORD env vars are required'); process.exit(1); }
 
 function log(msg) { console.log(`[reed-login ${new Date().toISOString().slice(11,19)}] ${msg}`); }
 
@@ -56,10 +58,19 @@ function log(msg) { console.log(`[reed-login ${new Date().toISOString().slice(11
       await ctx.close(); process.exit(1);
     }
 
+    // CAPTCHA → exit 3 so the caller can tell the user to retry later / use extension
+    const captcha = await page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], [class*="captcha"]').first().isVisible().catch(() => false);
+    if (captcha) {
+      log('CAPTCHA challenge shown — cannot complete server-side login right now.');
+      await page.screenshot({ path: path.join(TMP_DIR, `reed_refresh_captcha_${Date.now()}.png`) }).catch(() => {});
+      await ctx.close(); process.exit(3);
+    }
+
     const loggedIn = finalUrl.startsWith('https://www.reed.co.uk') &&
                      !finalUrl.includes('secure.reed.co.uk') && !finalUrl.includes('signin');
     if (!loggedIn) {
       log(`Login failed — still on: ${finalUrl}`);
+      await page.screenshot({ path: path.join(TMP_DIR, `reed_refresh_failed_${Date.now()}.png`) }).catch(() => {});
       await ctx.close(); process.exit(1);
     }
     log(`Logged in! URL: ${finalUrl}`);

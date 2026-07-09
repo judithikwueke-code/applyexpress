@@ -2661,6 +2661,64 @@ def profile():
         </form>
       </div>
 
+      <div class="card" id="sessions">
+        <h2>Job board sessions</h2>
+        <p class="pf-sub">Applying needs a logged-in browser session per job board. Sessions expire every
+          few weeks — when one does, applications on that board fail until it's refreshed.</p>
+        <div class="pf-bl-row">
+          <span class="pf-bl-name">Reed</span>
+          <span id="sess-reed-age" class="pf-muted">checking&#8230;</span>
+          <button type="button" class="btn btn-primary" id="sess-reed-btn"
+                  onclick="refreshReed()" style="white-space:nowrap">Refresh now</button>
+        </div>
+        <div class="pf-bl-row">
+          <span class="pf-bl-name">LinkedIn</span>
+          <span id="sess-linkedin-age" class="pf-muted">checking&#8230;</span>
+          <span class="pf-hint">refresh via desktop Chrome extension</span>
+        </div>
+        <div class="pf-bl-row">
+          <span class="pf-bl-name">Indeed</span>
+          <span id="sess-indeed-age" class="pf-muted">checking&#8230;</span>
+          <span class="pf-hint">refresh via desktop Chrome extension</span>
+        </div>
+        <p id="sess-msg" class="pf-muted" style="margin-top:10px"></p>
+        <script>
+        async function sessAge(p){{
+          try{{
+            const j = await (await fetch('/profile/refresh-session-status?platform='+p)).json();
+            const el = document.getElementById('sess-'+p+'-age');
+            if(j.session_age_days === undefined){{ el.textContent = 'no session uploaded'; el.style.color='#dc2626'; }}
+            else{{
+              const d = j.session_age_days;
+              el.textContent = d < 1 ? 'updated today' : 'updated ' + Math.round(d) + ' day' + (Math.round(d)===1?'':'s') + ' ago';
+              el.style.color = d > 21 ? '#dc2626' : (d > 10 ? '#d97706' : '#16a34a');
+            }}
+          }}catch(e){{}}
+        }}
+        ['reed','linkedin','indeed'].forEach(sessAge);
+        async function refreshReed(){{
+          const btn = document.getElementById('sess-reed-btn'), msg = document.getElementById('sess-msg');
+          btn.disabled = true; msg.textContent = 'Logging in to Reed from the server (up to 2 minutes)…';
+          try{{
+            const r = await fetch('/profile/refresh-session', {{method:'POST',
+              headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:'platform=reed'}});
+            const j = await r.json();
+            if(!j.ok){{ msg.textContent = j.reason || 'Could not start refresh.'; btn.disabled = false; return; }}
+            let tries = 0;
+            const t = setInterval(async () => {{
+              tries++;
+              const s = await (await fetch('/profile/refresh-session-status?platform=reed')).json();
+              if(s.state === 'ok'){{ clearInterval(t); msg.textContent = 'Reed session refreshed ✓'; btn.disabled = false; sessAge('reed'); }}
+              else if(s.state === 'captcha' || s.state === 'failed'){{
+                clearInterval(t); msg.textContent = (s.state === 'captcha' ? '' : 'Failed: ') + (s.detail || 'Login failed.'); btn.disabled = false;
+              }}
+              else if(tries > 50){{ clearInterval(t); msg.textContent = 'Still running — check back in a minute.'; btn.disabled = false; }}
+            }}, 3000);
+          }}catch(e){{ msg.textContent = 'Error: ' + e; btn.disabled = false; }}
+        }}
+        </script>
+      </div>
+
       <div class="card" id="blacklist">
         <h2>Company blacklist</h2>
         <p class="pf-sub">Jobs from these companies will be skipped automatically.</p>
@@ -6698,6 +6756,97 @@ def api_save_session():
     session_file.write_text(_json.dumps(cookies, indent=2))
     log.info(f"[save_session] Saved {len(cookies)} {platform} cookies for user {u['id']}")
     return jsonify({"ok": True, "platform": platform, "cookies_saved": len(cookies), "count": len(cookies)})
+
+
+# ── Server-side session refresh (Reed) ────────────────────────────────────────
+# Lets users refresh an expired Reed session from any device (incl. phone) —
+# runs a Playwright login on the server with their stored credentials.
+# LinkedIn/Indeed still need the extension: LinkedIn blocks datacenter logins,
+# Indeed requires Google OAuth + OTP.
+
+def _session_status_file(user_id: int, platform: str) -> Path:
+    d = Path(DATA_DIR) / "users" / str(user_id) / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"refresh_{platform}_status.json"
+
+def _run_reed_refresh(user_id: int, email: str, password: str):
+    import subprocess
+    status_file = _session_status_file(user_id, "reed")
+    udir = Path(DATA_DIR) / "users" / str(user_id)
+    (udir / ".tmp").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.update({"TMP_DIR": str(udir / ".tmp"),
+                "REED_EMAIL": email, "REED_PASSWORD": password})
+
+    def _write(state, detail=""):
+        status_file.write_text(json.dumps(
+            {"state": state, "detail": detail[:400],
+             "ts": datetime.utcnow().isoformat()}))
+
+    _write("running")
+    try:
+        r = subprocess.run(["node", str(ROOT / "tools" / "reed_login_once.js")],
+                           capture_output=True, text=True, timeout=180,
+                           cwd=str(ROOT), env=env)
+        tail = (r.stdout or "").strip()[-300:] or (r.stderr or "").strip()[-300:]
+        if r.returncode == 0:
+            _write("ok", "Session refreshed.")
+            log.info(f"[refresh_session] Reed session refreshed for user {user_id}")
+        elif r.returncode == 3:
+            _write("captcha", "Reed showed a CAPTCHA. Try again in a few hours, "
+                              "or refresh via the desktop Chrome extension.")
+        else:
+            _write("failed", tail)
+            log.warning(f"[refresh_session] Reed refresh failed for user {user_id}: {tail[-150:]}")
+    except subprocess.TimeoutExpired:
+        _write("failed", "Login timed out after 3 minutes.")
+    except Exception as e:
+        _write("failed", str(e))
+
+@app.route("/profile/refresh-session", methods=["POST"])
+@login_required
+def refresh_session():
+    u = current_user()
+    platform = request.values.get("platform", "")
+    if platform != "reed":
+        return jsonify({"ok": False, "reason": "Server-side refresh is available for Reed only. "
+                        "Use the Chrome extension for LinkedIn and Indeed."}), 400
+    password = _dec(u.get("reed_pass", ""))
+    if not password:
+        return jsonify({"ok": False, "reason": "No Reed password saved — add it under "
+                        "'Email & job board credentials' first."}), 400
+    sf = _session_status_file(u["id"], "reed")
+    if sf.exists():
+        try:
+            st = json.loads(sf.read_text())
+            cutoff = (datetime.utcnow() - timedelta(minutes=4)).isoformat()
+            if st.get("state") == "running" and st.get("ts", "") > cutoff:
+                return jsonify({"ok": True, "state": "running"})
+        except Exception:
+            pass
+    email = u.get("reed_email") or u["email"]
+    threading.Thread(target=_run_reed_refresh, args=(u["id"], email, password),
+                     daemon=True).start()
+    return jsonify({"ok": True, "state": "running"})
+
+@app.route("/profile/refresh-session-status")
+@login_required
+def refresh_session_status():
+    u = current_user()
+    platform = request.args.get("platform", "reed")
+    if platform not in ("reed", "linkedin", "indeed"):
+        return jsonify({"error": "bad platform"}), 400
+    out = {"state": "idle", "detail": ""}
+    sf = _session_status_file(u["id"], platform)
+    if sf.exists():
+        try:
+            out = json.loads(sf.read_text())
+        except Exception:
+            pass
+    p = Path(DATA_DIR) / "users" / str(u["id"]) / "sessions" / f"{platform}.json"
+    if p.exists():
+        out["session_age_days"] = round((time.time() - p.stat().st_mtime) / 86400, 1)
+    return jsonify(out)
 
 
 @app.route("/api/email_test", methods=["POST"])
