@@ -307,7 +307,13 @@ def main():
                 pdf_out = record["cv_docx"].replace(".docx", ".pdf")
                 try:
                     generate_cv_pdf(record["cv_docx"], pdf_out)
-                    record["cv_pdf"] = pdf_out
+                    # A healthy CV PDF is >4KB; ~1.5KB means no extractable
+                    # content — submit the .docx instead of a blank PDF.
+                    if os.path.getsize(pdf_out) < 2500:
+                        record["notes"] += "PDF looked empty — submitting .docx instead. "
+                        log.warning(f"Blank CV PDF detected ({os.path.getsize(pdf_out)}B) for {title} @ {company} — falling back to docx")
+                    else:
+                        record["cv_pdf"] = pdf_out
                 except Exception as e:
                     record["notes"] += f"PDF error: {e}. "
 

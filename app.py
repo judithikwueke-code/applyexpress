@@ -304,6 +304,31 @@ def _extract_cv_profile(cv_path: Path, user, keywords: str, location: str) -> st
 {cv_text}
 """
 
+def _cv_parse_warning(cv_path) -> str:
+    """Parse an uploaded CV with the pipeline's parser and warn about anything
+    it cannot read — so users learn at upload time, not via blank applications."""
+    try:
+        from docx import Document as _DocxDocument
+        from tools.tailor_cv_docx import _parse_cv
+        d = _parse_cv(_DocxDocument(str(cv_path)))
+        problems = []
+        if not d["roles"]:
+            problems.append("work experience entries")
+        if not d["summary"]:
+            problems.append("a professional summary")
+        if not d["skills"]:
+            problems.append("a skills list")
+        if not d["contact"]:
+            problems.append("contact details")
+        if problems:
+            return (" ⚠ We could not read " + ", ".join(problems) + " from this CV. "
+                    "Tailored CVs may be sent with that content missing. Tip: use clear section "
+                    "headings (e.g. PROFESSIONAL SUMMARY, KEY SKILLS, PROFESSIONAL EXPERIENCE) and "
+                    "one line per role like 'Job Title | Company | Jan 2020 – Present'.")
+    except Exception:
+        pass
+    return ""
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -2315,7 +2340,7 @@ def profile():
                 try:
                     profile_text_content = _extract_cv_profile(cv_path, u, u["keywords"], u["search_location"])
                     (_user_dir(u["id"]) / "candidate_profile.md").write_text(profile_text_content)
-                    msg = "CV uploaded and profile updated from CV content."
+                    msg = "CV uploaded and profile updated from CV content." + _cv_parse_warning(cv_path)
                 except Exception as e:
                     msg = f"CV uploaded. (Profile extraction failed: {e})"
             else:
@@ -2368,7 +2393,7 @@ def profile():
                         (_user_dir(u["id"]) / "candidate_profile.md").write_text(profile_text_content)
                     except Exception:
                         pass
-                    msg = f'CV uploaded for "{spec["name"]}". Profile content updated.'
+                    msg = f'CV uploaded for "{spec["name"]}". Profile content updated.' + _cv_parse_warning(cv_path)
                 else:
                     msg = "Please upload a .docx file."
             else:

@@ -195,6 +195,26 @@ def _get_employer_context(org: str, context_map: dict) -> str:
 
 # ── CV parser ──────────────────────────────────────────────────────────────────
 
+# Known section names, matched case-insensitively so Title Case CVs
+# ("Professional Profile", "Key Skills & Expertise") parse too.
+_SECTION_NAMES = {
+    "professional profile", "profile", "professional summary", "summary",
+    "personal statement", "about me",
+    "key skills", "key skills expertise", "skills", "core competencies",
+    "competencies", "expertise", "technical skills", "key skills and expertise",
+    "professional experience", "experience", "work experience",
+    "employment history", "work history", "career history",
+    "education", "education training", "education and training",
+    "certifications", "certification", "certifications training",
+    "certifications and training", "training",
+    "certifications professional development",
+    "certifications and professional development",
+    "professional development", "licences", "licenses",
+}
+
+def _norm_heading(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", text.lower())).strip()
+
 def _is_section_heading(para) -> bool:
     text = para.text.strip()
     if not text or len(text) > 70:
@@ -206,7 +226,8 @@ def _is_section_heading(para) -> bool:
         and any(run.bold for run in para.runs if run.text.strip())
         and text[0] not in ("•", "-", "–", "*", "▪", "◦")
     )
-    return is_allcaps or is_hd_style or is_bold_short
+    is_known_name = len(text) < 50 and _norm_heading(text) in _SECTION_NAMES
+    return is_allcaps or is_hd_style or is_bold_short or is_known_name
 
 
 def _find_section_paragraphs(doc, keywords: list):
@@ -237,21 +258,43 @@ def _parse_cv(doc) -> dict:
         t = para.text.strip()
         return bool(t) and (t[0] in bullet_chars or "list" in para.style.name.lower())
 
+    # A line that is ONLY a date range (some CVs put dates under the role title)
+    _month = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
+    date_line_re = re.compile(
+        rf"^\(?\s*(?:{_month}\s+)?\d{{4}}\s*(?:[–—-]|to)\s*"
+        rf"(?:(?:{_month}\s+)?\d{{4}}|Present|Current|Now|Date)\s*\)?$", re.I)
+
+    def is_date_line(t):
+        return len(t) < 45 and bool(date_line_re.match(t))
+
     def is_role_header(para):
         t = para.text.strip()
-        if not t or is_bullet(para):
+        if not t or is_bullet(para) or is_date_line(t):
             return False
         has_pipe = "|" in t
         has_date = bool(re.search(
             r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}", t
         ))
         has_bold = any(r.bold for r in para.runs if r.text.strip())
-        return (has_bold or has_pipe or has_date) and len(t) < 120
+        # 'Title – Company' with no pipes/bold/dates (dates on the next line)
+        has_dash_pair = bool(re.search(r"\S\s+[–—-]\s+\S", t)) and not t.endswith(".")
+        return (has_bold or has_pipe or has_date or has_dash_pair) and len(t) < 120
 
     # Name + contact (packed into paragraph 0 with \n)
     p0 = doc.paragraphs[0].text.strip().split("\n") if doc.paragraphs else []
     name    = p0[0].strip() if p0 else ""
     contact = p0[1].strip() if len(p0) > 1 else ""
+    if not contact:
+        # Contact on its own paragraph(s) below the name
+        for para in doc.paragraphs[1:6]:
+            t = para.text.strip()
+            if not t:
+                continue
+            if _is_section_heading(para):
+                break
+            if "@" in t or re.search(r"\+?\d[\d\s()./-]{7,}", t):
+                contact = t
+                break
 
     # Summary
     _, sp = _find_section_paragraphs(doc, ["PROFESSIONAL SUMMARY", "SUMMARY", "PROFILE"])
@@ -271,14 +314,34 @@ def _parse_cv(doc) -> dict:
     for j, start in enumerate(role_starts):
         end = role_starts[j + 1] if j + 1 < len(role_starts) else len(sec)
         header = sec[start].text.strip()
-        parts  = [x.strip() for x in header.split("|")]
-        r_title = parts[0] if parts else header
-        r_org   = parts[1] if len(parts) > 1 else ""
-        r_dates = parts[2] if len(parts) > 2 else ""
+        if "|" in header:
+            parts  = [x.strip() for x in header.split("|")]
+            r_title = parts[0] if parts else header
+            r_org   = parts[1] if len(parts) > 1 else ""
+            r_dates = parts[2] if len(parts) > 2 else ""
+        else:
+            # 'Title – Org [\t dates]' — dates may also sit on the next line
+            r_dates = ""
+            hdr = header
+            if "\t" in hdr:
+                hdr, tail = hdr.split("\t", 1)
+                if is_date_line(tail.strip()):
+                    r_dates = tail.strip()
+            m = re.match(r"^(.*?)\s+[–—-]{1,2}\s+(.*)$", hdr.strip())
+            if m:
+                r_title, r_org = m.group(1).strip(), m.group(2).strip()
+            else:
+                r_title, r_org = hdr.strip(), ""
         raw_bullets = []
-        for bp in sec[start:end]:
+        for bp in sec[start + 1:end]:
+            t = bp.text.strip()
+            if not t:
+                continue
+            if not r_dates and is_date_line(t):
+                r_dates = t
+                continue
             if is_bullet(bp):
-                for line in bp.text.strip().split("\n"):
+                for line in t.split("\n"):
                     if line.strip():
                         raw_bullets.append(line.lstrip("•-–*▪◦○· ").strip())
         roles.append({"title": r_title, "org": r_org, "dates": r_dates, "bullets": raw_bullets})
@@ -501,6 +564,13 @@ def tailor_cv_docx(title: str, company: str, description: str, output_path: str 
             logger.warning(f"Could not load employer_context.json: {e}")
 
     data = _parse_cv(doc_base)
+
+    # Never build (and submit) an empty CV: if nothing could be extracted,
+    # fail loudly so the caller falls back to the original CV file instead.
+    if not data["roles"] and not data["skills"] and not data["summary"]:
+        raise ValueError(
+            "CV format not recognised — no summary, skills or work experience "
+            "could be extracted; refusing to build an empty CV")
 
     # Professional title under name — the candidate's REAL current title.
     # Never the target job title: claiming the advertised title as your own
