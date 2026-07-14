@@ -5,7 +5,7 @@ Each user's pipeline chain (default + specialties) runs in parallel with
 other users. Within a user, runs are sequential (to share Groq token budget).
 """
 import sys, os, sqlite3, subprocess, logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT    = Path("/opt/applyexpress")
@@ -23,6 +23,18 @@ load_dotenv(ROOT / ".env")
 
 db = sqlite3.connect(str(DB_PATH))
 db.row_factory = sqlite3.Row
+
+# Self-heal: a killed chain (systemd timeout, OOM, reboot) leaves runs stuck in
+# 'running', which would otherwise skip that user on every future trigger.
+# Any run still 'running' after 2 hours is dead — mark it interrupted.
+stale = db.execute(
+    "UPDATE runs SET status='interrupted', finished_at=? WHERE status='running' AND started_at < ?",
+    (datetime.utcnow().isoformat(),
+     (datetime.utcnow() - timedelta(hours=2)).isoformat())
+).rowcount
+db.commit()
+if stale:
+    log.warning(f"Self-heal: marked {stale} stale 'running' run(s) as interrupted")
 
 users = db.execute(
     """SELECT id FROM users

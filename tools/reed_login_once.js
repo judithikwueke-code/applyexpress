@@ -39,7 +39,10 @@ function log(msg) { console.log(`[reed-login ${new Date().toISOString().slice(11
     log('Already logged in!');
   } else {
     log(`Filling credentials for ${EMAIL}...`);
-    await page.locator('#signin_email, input[type="email"]').first().fill(EMAIL);
+    // The sign-in form only renders after Cloudflare Turnstile completes — can take >30s
+    const emailField = page.locator('#signin_email, input[type="email"]').first();
+    await emailField.waitFor({ state: 'visible', timeout: 90000 });
+    await emailField.fill(EMAIL);
     await page.waitForTimeout(300);
     await page.locator('#signin_password, input[type="password"]').first().fill(PASSWORD);
     await page.waitForTimeout(300);
