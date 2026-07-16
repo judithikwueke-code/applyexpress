@@ -10,6 +10,8 @@ Sources:
   - RemoteOK (free, no auth)
   - Greenhouse job boards (free, no auth — direct company apply)
   - Lever job boards (free, no auth — direct company apply)
+  - NHS Jobs / jobs.nhs.uk (free, no auth — server-rendered HTML; most adverts
+    apply through Trac, so these surface as needs_review/sponsor_review)
 
 Output: .tmp/jobs_raw.json
 
@@ -670,6 +672,85 @@ def fetch_linkedin(keywords: str, location: str, count: int) -> list:
 # Main fetcher
 # ---------------------------------------------------------------------------
 
+def fetch_nhs(keywords: str, count: int) -> list:
+    """NHS Jobs (jobs.nhs.uk) — no API, but the search pages are server-rendered
+    with stable data-test markup. Each comma-separated keyword phrase is searched
+    separately (NHS best-match handles phrases well, giant keyword strings badly).
+    Job detail pages provide the description, AfC band, and the Trac apply link.
+    """
+    import re as _re
+    from html import unescape as _unescape
+
+    _UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")}
+    terms = [t.strip() for t in keywords.split(",") if t.strip()][:3]
+    jobs, seen_refs = [], set()
+
+    def _txt(s):
+        return _re.sub(r"\s+", " ", _unescape(_re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+    try:
+        # ── 1. Search pages: one request per keyword phrase ──
+        results = []
+        for term in terms:
+            try:
+                r = requests.get("https://www.jobs.nhs.uk/candidate/search/results",
+                                 params={"keyword": term, "language": "en"},
+                                 headers=_UA, timeout=20)
+                if r.status_code != 200:
+                    logger.warning(f"NHS Jobs search '{term}' returned {r.status_code}")
+                    continue
+                # Split the page into per-result chunks on the result <li> marker
+                chunks = _re.split(r'data-test="search-result"', r.text)[1:]
+                for chunk in chunks:
+                    m = _re.search(r'<a href="(/candidate/jobadvert/([^"?]+))[^"]*"[^>]*'
+                                   r'data-test="search-result-job-title"\s*>(.*?)</a>', chunk, _re.S)
+                    if not m or m.group(2) in seen_refs:
+                        continue
+                    seen_refs.add(m.group(2))
+                    emp = _re.search(r'data-test="search-result-location">\s*<h3[^>]*>(.*?)<div', chunk, _re.S)
+                    loc = _re.search(r'class="location-font-size">(.*?)</div>', chunk, _re.S)
+                    sal = _re.search(r'data-test="search-result-salary">(.*?)</', chunk, _re.S)
+                    pub = _re.search(r'data-test="search-result-publicationDate">(.*?)</', chunk, _re.S)
+                    results.append({
+                        "id": m.group(2),
+                        "title": _txt(m.group(3)),
+                        "url": "https://www.jobs.nhs.uk" + m.group(1),
+                        "company": _txt(emp.group(1)) if emp else "NHS",
+                        "location": _txt(loc.group(1)) if loc else "",
+                        "salary_text": _txt(sal.group(1)) if sal else "",
+                        "date_posted": _txt(pub.group(1)) if pub else "",
+                    })
+                time.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"NHS Jobs search '{term}' failed: {e}")
+
+        # ── 2. Detail pages: description + band (capped, polite) ──
+        for raw in results[:max(count, 10)]:
+            try:
+                r = requests.get(raw["url"], headers=_UA, timeout=20)
+                if r.status_code == 200:
+                    band = _re.search(r'id="payscheme-band"[^>]*>(.*?)</', r.text, _re.S)
+                    body = _re.sub(r"<script.*?</script>", "", r.text, flags=_re.S)
+                    text = _txt(body)
+                    # Advert content starts at "Job overview"; nav/cookie text precedes it
+                    idx = text.find("Job overview")
+                    desc = text[idx:] if idx != -1 else text[-6000:]
+                    if band:
+                        desc = f"NHS pay: {_txt(band.group(1))}. {raw['salary_text']}. " + desc
+                    raw["description"] = desc
+                time.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"NHS Jobs detail fetch failed for {raw['id']}: {e}")
+            raw.setdefault("description", f"{raw['title']} at {raw['company']}. {raw['salary_text']}")
+            jobs.append(normalise_job(raw, "nhs"))
+
+        logger.info(f"NHS Jobs: {len(jobs)} jobs (from {len(results)} search results, terms={terms})")
+    except Exception as e:
+        logger.warning(f"NHS Jobs fetch failed: {e}")
+    return jobs
+
+
 def fetch_all_jobs(keywords: str, location: str, count: int, indeed_cookies: str = "") -> list:
     per_source = max(count // 4, 10)
 
@@ -689,6 +770,7 @@ def fetch_all_jobs(keywords: str, location: str, count: int, indeed_cookies: str
     # all_jobs += fetch_remoteok(keywords, per_source)  # disabled: returns US-only jobs
     all_jobs += fetch_indeed(keywords, location, per_source, cookies_path=indeed_cookies)
     all_jobs += fetch_linkedin(keywords, location, per_source)
+    all_jobs += fetch_nhs(keywords, per_source)
 
     unique_jobs = deduplicate(all_jobs)
     logger.info(f"Total after deduplication: {len(unique_jobs)} jobs (from {len(all_jobs)} raw)")

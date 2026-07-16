@@ -242,7 +242,9 @@ def main():
         # Guarantee LinkedIn Easy Apply and Indeed jobs get slots even if outscored by Reed.
         # These are the most automatable sources — Reed descriptions score higher because
         # they include recruiter notes, but LinkedIn/Indeed Easy Apply is faster to submit.
-        _PLATFORM_RESERVE = {"linkedin": 3, "indeed": 2}
+        # nhs jobs can't auto-apply (Trac) but must reach tailoring so they land
+        # in the sponsor-review digest with a CV + cover letter attached
+        _PLATFORM_RESERVE = {"linkedin": 3, "indeed": 2, "nhs": 3}
         _qualifying_urls = {j.get("url", "") for j in qualifying}
         for _src, _slots in _PLATFORM_RESERVE.items():
             _src_in_qualifying = sum(1 for j in qualifying if j.get("source") == _src)
