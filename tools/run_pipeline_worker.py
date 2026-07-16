@@ -294,6 +294,7 @@ def main():
                 "url": job.get("url", ""), "source": job.get("source", ""),
                 "score": job.get("score", 0),
                 "cv_docx": None, "cv_pdf": None, "cover_letter_path": None,
+                "supporting_statement_path": None,
                 "status": "needs_review", "ats": "unknown", "notes": "",
             }
 
@@ -327,6 +328,28 @@ def main():
                 record["cover_letter_path"] = cl_out
             except Exception as e:
                 record["notes"] += f"Cover letter error: {e}. "
+
+            # NHS/Trac roles are scored against a Person Specification and applied
+            # to manually — generate a paste-ready, anonymised supporting statement.
+            if job.get("source") == "nhs":
+                try:
+                    from tools.generate_supporting_statement import generate_supporting_statement
+                    cv_text = ""
+                    try:
+                        from docx import Document as _Doc
+                        _cvp = record["cv_docx"] or str(udir / "cv.docx")
+                        cv_text = "\n".join(p.text for p in _Doc(_cvp).paragraphs if p.text.strip())
+                    except Exception:
+                        pass
+                    stmt = generate_supporting_statement(
+                        job, profile_text, cv_text,
+                        first_name=u.get("first_name", ""), last_name=u.get("last_name", ""))
+                    ss_out = str(tmpdir / f"supporting_statement_{_slug(company)}_{_slug(title)}.txt")
+                    Path(ss_out).write_text(stmt)
+                    record["supporting_statement_path"] = ss_out
+                    log.info(f"Supporting statement generated for NHS role: {title} @ {company}")
+                except Exception as e:
+                    record["notes"] += f"Supporting statement error: {e}. "
 
             report["jobs"].append(record)
             time.sleep(2)
@@ -365,7 +388,11 @@ def main():
 <tr style="background:{bg}">
   <td style="padding:4px 10px 10px;color:#555">Apply at</td>
   <td style="padding:4px 10px 10px"><a href="{record['url']}" style="color:#1976d2">{record['url']}</a></td>
-</tr>"""
+</tr>""" + (f"""
+<tr style="background:{bg}">
+  <td style="padding:4px 10px 10px;color:#555">NHS statement</td>
+  <td style="padding:4px 10px 10px;color:#388e3c">&#9989; Anonymised supporting statement attached (paste into the Trac form)</td>
+</tr>""" if record.get("supporting_statement_path") else "")
 
             html = f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:640px">
 <h2 style="color:#6200ea">&#127919; Visa Sponsor Report — {n} match{'es' if n != 1 else ''} this run</h2>
@@ -378,6 +405,7 @@ Tailored CVs and cover letters are attached. Apply manually using the links belo
 <h3 style="color:#388e3c">How to apply for each role:</h3>
 <ol>
   <li>Find the matching CV and cover letter in the attachments (named by company)</li>
+  <li>For NHS roles, open the attached supporting statement — it is anonymised (no name or personal details, as Trac requires) and written against the job's person specification. Log in to Trac, use "populate from a previous application" for your history and referees, and paste the statement into the supporting-information box.</li>
   <li>Click the job link and apply directly</li>
 </ol>
 <p style="color:#757575;font-size:12px;margin-top:24px">
@@ -388,7 +416,7 @@ Tailored CVs and cover letters are attached. Apply manually using the links belo
 
             seen_files: set = set()
             for record, _ in matches:
-                for path_key in ("cv_docx", "cv_pdf", "cover_letter_path"):
+                for path_key in ("cv_docx", "cv_pdf", "cover_letter_path", "supporting_statement_path"):
                     fpath = record.get(path_key) or ""
                     if fpath and fpath not in seen_files and Path(fpath).exists():
                         seen_files.add(fpath)
