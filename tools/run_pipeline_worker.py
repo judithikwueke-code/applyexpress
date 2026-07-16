@@ -298,6 +298,33 @@ def main():
                 "status": "needs_review", "ats": "unknown", "notes": "",
             }
 
+            is_nhs = job.get("source") == "nhs"
+
+            # NHS/Trac applications use the structured Trac form + a supporting
+            # statement — they take no CV or cover letter, so skip both (saves
+            # LLM budget) and produce only the anonymised supporting statement.
+            if is_nhs:
+                try:
+                    from tools.generate_supporting_statement import generate_supporting_statement
+                    cv_text = ""
+                    try:
+                        from docx import Document as _Doc
+                        cv_text = "\n".join(p.text for p in _Doc(str(udir / "cv.docx")).paragraphs if p.text.strip())
+                    except Exception:
+                        pass
+                    stmt = generate_supporting_statement(
+                        job, profile_text, cv_text,
+                        first_name=u.get("first_name", ""), last_name=u.get("last_name", ""))
+                    ss_out = str(tmpdir / f"supporting_statement_{_slug(company)}_{_slug(title)}.txt")
+                    Path(ss_out).write_text(stmt)
+                    record["supporting_statement_path"] = ss_out
+                    log.info(f"Supporting statement generated for NHS role: {title} @ {company}")
+                except Exception as e:
+                    record["notes"] += f"Supporting statement error: {e}. "
+                report["jobs"].append(record)
+                time.sleep(2)
+                continue
+
             cv_out = str(tmpdir / f"cv_{_slug(company)}_{_slug(title)}.docx")
             try:
                 tailor_cv_docx(title, company, desc, cv_out)
@@ -328,28 +355,6 @@ def main():
                 record["cover_letter_path"] = cl_out
             except Exception as e:
                 record["notes"] += f"Cover letter error: {e}. "
-
-            # NHS/Trac roles are scored against a Person Specification and applied
-            # to manually — generate a paste-ready, anonymised supporting statement.
-            if job.get("source") == "nhs":
-                try:
-                    from tools.generate_supporting_statement import generate_supporting_statement
-                    cv_text = ""
-                    try:
-                        from docx import Document as _Doc
-                        _cvp = record["cv_docx"] or str(udir / "cv.docx")
-                        cv_text = "\n".join(p.text for p in _Doc(_cvp).paragraphs if p.text.strip())
-                    except Exception:
-                        pass
-                    stmt = generate_supporting_statement(
-                        job, profile_text, cv_text,
-                        first_name=u.get("first_name", ""), last_name=u.get("last_name", ""))
-                    ss_out = str(tmpdir / f"supporting_statement_{_slug(company)}_{_slug(title)}.txt")
-                    Path(ss_out).write_text(stmt)
-                    record["supporting_statement_path"] = ss_out
-                    log.info(f"Supporting statement generated for NHS role: {title} @ {company}")
-                except Exception as e:
-                    record["notes"] += f"Supporting statement error: {e}. "
 
             report["jobs"].append(record)
             time.sleep(2)
@@ -398,7 +403,9 @@ def main():
 <h2 style="color:#6200ea">&#127919; Visa Sponsor Report — {n} match{'es' if n != 1 else ''} this run</h2>
 <p>The following jobs were found at <strong>UK-licensed visa sponsors</strong>.<br>
 <strong style="color:#d32f2f">None were auto-submitted.</strong>
-Tailored CVs and cover letters are attached. Apply manually using the links below.</p>
+Relevant documents are attached per role — tailored CV and cover letter for standard
+employers; an anonymised supporting statement for NHS/Trac roles (which take no CV).
+Apply manually using the links below.</p>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;border:1px solid #e0e0e0">
 {rows_html}
 </table>
@@ -493,6 +500,27 @@ Tailored CVs and cover letters are attached. Apply manually using the links belo
                         record["notes"] += "CAPTCHA or email verification blocked previous attempt — needs manual apply. "
                         record["status"] = "skipped"
                         continue
+
+            # ── NHS/Trac jobs: never auto-applied (manual Trac submission). ──
+            # Always forward to the review digest with the supporting statement,
+            # regardless of sponsor_check or name-matching the sponsor list —
+            # every NHS employer is a licensed visa sponsor.
+            if record.get("source") == "nhs":
+                sponsor_matches.append((record, "NHS (licensed sponsor)"))
+                record["status"] = "sponsor_review"
+                record["notes"] += "NHS role — supporting statement ready; apply manually via Trac. "
+                try:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO applications
+                           (user_id, run_db_id, title, company, url, status, notes, applied_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (user_id, run_db_id, title, company, job_url, "sponsor_review",
+                         record.get("notes", "")[:500], datetime.utcnow().isoformat()))
+                    conn.commit()
+                except Exception as db_err:
+                    log.warning(f"DB insert failed for NHS sponsor_review {title}: {db_err}")
+                log.info(f"NHS role forwarded for manual Trac apply: {title} @ {company}")
+                continue
 
             # ── Sponsor licence check (only for users with sponsor_check=1) ──
             if u.get("sponsor_check") and record.get("cover_letter_path"):
