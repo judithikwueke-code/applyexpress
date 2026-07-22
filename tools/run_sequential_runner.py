@@ -55,10 +55,11 @@ def main():
         try:
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
-            u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
             conn.close()
-            if not u:
+            if not row:
                 return
+            u = dict(row)  # sqlite3.Row has no .get(); use a plain dict
 
             # Decrypt smtp password
             sys.path.insert(0, str(Path(root)))
