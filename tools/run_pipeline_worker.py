@@ -265,11 +265,40 @@ def main():
         qualifying = sorted(qualifying, key=lambda j: j["score"], reverse=True)[:18]
         log.info(f"Qualifying jobs: {len(qualifying)} (threshold={threshold})")
 
+        # ── Pre-filter BEFORE tailoring ───────────────────────────────────────
+        # The job boards return the same listings every run. Without this, the
+        # same handful of jobs get a full (expensive) CV tailored 10x/day even
+        # though they were already applied to or just attempted — which both
+        # wastes the LLM budget and makes each run so long the evening chain is
+        # killed by the timeout. Drop jobs already handled, or attempted within
+        # the last 20h (retried at most once/day, not every run).
+        def _recently_handled(url: str) -> bool:
+            if not url:
+                return False
+            row = conn.execute(
+                "SELECT status, applied_at FROM applications "
+                "WHERE user_id=? AND url=? ORDER BY id DESC LIMIT 1",
+                (user_id, url)).fetchone()
+            if not row:
+                return False
+            if row["status"] in ("applied", "sponsor_review"):
+                return True  # done — never reprocess
+            try:  # needs_review / failed → short cooldown so we don't re-tailor every run
+                return (datetime.utcnow() - datetime.fromisoformat(row["applied_at"])) < timedelta(hours=20)
+            except Exception:
+                return False
+
+        _before = len(qualifying)
+        qualifying = [j for j in qualifying if not _recently_handled(j.get("url", ""))]
+        _skipped = _before - len(qualifying)
+        if _skipped:
+            log.info(f"Pre-filter: skipped {_skipped} already-handled/cooling-down job(s) before tailoring")
+
         if not qualifying:
             update(status="completed", finished_at=datetime.utcnow().isoformat(),
                    jobs_applied=0, report_json=json.dumps({"jobs": [], "run_id": run_id}))
             conn.close()
-            log.info("No qualifying jobs — pipeline complete")
+            log.info("No new qualifying jobs (all recently handled) — pipeline complete")
             return
 
         # ── 3. Tailor CV + cover letter ───────────────────────────────────────
