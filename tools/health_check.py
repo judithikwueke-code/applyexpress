@@ -111,6 +111,40 @@ if locks:
 else:
     record("chromium_locks", True, detail="none found")
 
+# ── Check 4b: Playwright browser binary present (auto-reinstall if missing) ────
+# Playwright npm updates bump the expected Chromium build; if the matching
+# browser was never installed, EVERY apply script + the Reed session refresh
+# fail at launchPersistentContext. Detect and self-heal — this has silently
+# killed all browser automation twice.
+try:
+    probe = subprocess.run(
+        ["node", "-e",
+         "const{chromium}=require('playwright');"
+         "chromium.launchPersistentContext(require('os').tmpdir()+'/pw_probe',"
+         "{headless:true,args:['--no-sandbox','--disable-dev-shm-usage']})"
+         ".then(c=>c.close()).then(()=>process.exit(0)).catch(e=>{"
+         "console.error(e.message.split('\\n')[0]);process.exit(1)})"],
+        capture_output=True, text=True, timeout=90, cwd=str(ROOT),
+    )
+    if probe.returncode == 0:
+        record("playwright_browser", True, detail="chromium launches")
+    else:
+        detail = (probe.stderr or probe.stdout).strip()[-120:]
+        if "Executable doesn't exist" in detail or "install" in detail.lower():
+            log.info("Playwright browser missing — reinstalling…")
+            inst = subprocess.run(
+                ["npx", "playwright", "install", "chromium", "chromium-headless-shell"],
+                capture_output=True, text=True, timeout=600, cwd=str(ROOT),
+            )
+            ok = inst.returncode == 0
+            record("playwright_browser", ok,
+                   action="Reinstalled chromium" if ok else "Reinstall FAILED",
+                   detail=detail)
+        else:
+            record("playwright_browser", False, detail=detail)
+except Exception as e:
+    record("playwright_browser", False, detail=str(e)[:120])
+
 # ── Check 5: Session cookie health (expiry + auto-refresh for Reed) ──────────
 def _count_expired_cookies(session_file: Path) -> tuple[int, int]:
     """Return (expired_count, total_count) for a sessions JSON file."""
