@@ -27,7 +27,7 @@ GROQ_API_KEY_3  = os.getenv("GROQ_API_KEY_3", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 
-GROQ_MODEL      = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL      = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 GEMINI_MODEL    = "gemini-2.0-flash"
 
@@ -64,16 +64,16 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> str
     if LLM_PROVIDER == "anthropic" and ANTHROPIC_API_KEY:
         return _call_anthropic(system_prompt, user_prompt, max_tokens)
 
-    # Primary: Groq account 1
+    # Primary: Groq account 1. ANY failure (rate limit, TPD, or a model that
+    # Groq has decommissioned → 404) must fall through to the next provider —
+    # never raise here, or one dead model silently zeroes every job's score.
     if GROQ_API_KEY and not _groq_tpd_exhausted:
         try:
             return _call_groq(system_prompt, user_prompt, max_tokens, GROQ_API_KEY)
         except RuntimeError as e:
             if _is_tpd_error(str(e)):
-                logger.warning("Groq account 1 daily limit exhausted — trying account 2")
                 _groq_tpd_exhausted = True
-            else:
-                raise
+            logger.warning(f"Groq account 1 failed ({e}) — trying account 2")
 
     # Fallback 1: Groq account 2
     if GROQ_API_KEY_2 and not _groq_tpd_exhausted_2:
@@ -81,10 +81,8 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> str
             return _call_groq(system_prompt, user_prompt, max_tokens, GROQ_API_KEY_2)
         except RuntimeError as e:
             if _is_tpd_error(str(e)):
-                logger.warning("Groq account 2 daily limit exhausted — trying account 3")
                 _groq_tpd_exhausted_2 = True
-            else:
-                raise
+            logger.warning(f"Groq account 2 failed ({e}) — trying account 3")
 
     # Fallback 2: Groq account 3
     if GROQ_API_KEY_3 and not _groq_tpd_exhausted_3:
@@ -92,10 +90,8 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> str
             return _call_groq(system_prompt, user_prompt, max_tokens, GROQ_API_KEY_3)
         except RuntimeError as e:
             if _is_tpd_error(str(e)):
-                logger.warning("Groq account 3 daily limit exhausted — trying Gemini")
                 _groq_tpd_exhausted_3 = True
-            else:
-                raise
+            logger.warning(f"Groq account 3 failed ({e}) — trying Gemini")
 
     # Fallback 3: Gemini
     if GEMINI_API_KEY and not _gemini_credits_exhausted:
@@ -104,9 +100,7 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> str
         except RuntimeError as e:
             if "credits exhausted" in str(e):
                 _gemini_credits_exhausted = True
-                logger.warning("Gemini prepaid credits exhausted — falling back to Anthropic")
-            else:
-                raise
+            logger.warning(f"Gemini failed ({e}) — falling back to Anthropic")
 
     # Fallback 4: Anthropic (paid, Haiku) — last resort so the pipeline never
     # silently scores every job 0 when the free tiers are exhausted.

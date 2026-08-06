@@ -220,7 +220,10 @@ def main():
                 result = score_job(job, profile_text)
                 job["score"] = result.get("score", 0)
                 job["score_reason"] = result.get("reason", "")
-                if _url:
+                # Only cache a real score. score_job swallows LLM errors and
+                # returns 0, so caching 0 would poison the cache for 7 days and
+                # zero out every future run — never cache a 0.
+                if _url and job["score"] > 0:
                     conn.execute(
                         "INSERT OR REPLACE INTO job_scores (user_id, specialty_id, url, score, reason, scored_at) VALUES (?,?,?,?,?,?)",
                         (user_id, _spec_key, _url, job["score"], job["score_reason"][:300],
