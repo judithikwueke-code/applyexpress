@@ -23,7 +23,77 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_STATE')      sendResponse({ isRunning: state.isRunning, statusText: state.statusText });
   if (msg.type === 'START_APPLYING') { handleStart(msg); sendResponse({ ok: true }); }
   if (msg.type === 'STOP_APPLYING')  { state.isRunning = false; sendResponse({ ok: true }); }
+  if (msg.type === 'SYNC_SESSIONS')  { syncSessions(msg.serverUrl, msg.apiKey).then(sendResponse); }
   return true;
+});
+
+
+// -- Session sync ------------------------------------------------------------
+// Pushes this browser's live cookies for each job platform to the server so
+// headless Playwright runs can reuse an already-authenticated session.
+// LinkedIn/Indeed can never log in server-side (datacenter IPs get checkpointed
+// every time), so syncing real cookies from the user's own logged-in browser is
+// the only way those sessions get refreshed.
+const SESSION_DOMAINS = {
+  reed:     ['reed.co.uk'],
+  indeed:   ['indeed.co.uk', 'indeed.com'],
+  linkedin: ['linkedin.com'],
+};
+
+function chromeSameSiteToPlaywright(s) {
+  if (s === 'no_restriction') return 'None';
+  if (s === 'strict')         return 'Strict';
+  return 'Lax'; // chrome's 'lax' and 'unspecified' both behave as Lax
+}
+
+async function captureCookies(domains) {
+  const seen = new Map();
+  for (const domain of domains) {
+    const raw = await chrome.cookies.getAll({ domain });
+    for (const c of raw) {
+      const key = c.domain + '|' + c.name + '|' + c.path;
+      seen.set(key, {
+        name:     c.name,
+        value:    c.value,
+        domain:   c.domain,
+        path:     c.path,
+        expires:  c.session ? -1 : (c.expirationDate || -1),
+        httpOnly: c.httpOnly,
+        secure:   c.secure,
+        sameSite: chromeSameSiteToPlaywright(c.sameSite),
+      });
+    }
+  }
+  return Array.from(seen.values());
+}
+
+async function syncSessions(serverUrl, apiKey) {
+  const results = {};
+  for (const [platform, domains] of Object.entries(SESSION_DOMAINS)) {
+    try {
+      const cookies = await captureCookies(domains);
+      if (!cookies.length) { results[platform] = { ok: false, reason: 'not logged in' }; continue; }
+      const resp = await fetch(serverUrl + '/api/save_session', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body:    JSON.stringify({ platform, cookies }),
+      });
+      const data = await resp.json();
+      results[platform] = { ok: !!data.ok, reason: data.reason, count: data.count };
+    } catch (e) {
+      results[platform] = { ok: false, reason: e.message };
+    }
+  }
+  return results;
+}
+
+// Auto-sync every 15 min so a session refresh in the browser reaches the
+// server without the user needing to open the popup.
+chrome.alarms.create('syncSessions', { periodInMinutes: 15 });
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'syncSessions') return;
+  const { serverUrl, apiKey } = await chrome.storage.local.get(['serverUrl', 'apiKey']);
+  if (serverUrl && apiKey) await syncSessions(serverUrl, apiKey);
 });
 
 

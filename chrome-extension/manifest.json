@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ApplyExpress — AI Job Applications",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Auto-fills job applications on Greenhouse, Lever, Reed and more. Tailored CV and cover letter per role via ApplyExpress.",
 
   "permissions": [

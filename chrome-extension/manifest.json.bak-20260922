@@ -1,0 +1,71 @@
+{
+  "manifest_version": 3,
+  "name": "ApplyExpress — AI Job Applications",
+  "version": "1.0.6",
+  "description": "Auto-fills job applications on Greenhouse, Lever, Reed and more. Tailored CV and cover letter per role via ApplyExpress.",
+
+  "permissions": [
+    "tabs",
+    "storage",
+    "scripting",
+    "alarms",
+    "cookies"
+  ],
+
+  "host_permissions": [
+    "https://*.greenhouse.io/*",
+    "https://boards-api.greenhouse.io/*",
+    "https://*.lever.co/*",
+    "https://*.reed.co.uk/*",
+    "https://reed.co.uk/*",
+    "https://*.workable.com/*",
+    "https://*.ashbyhq.com/*",
+    "https://*.indeed.co.uk/*",
+    "https://*.indeed.com/*",
+    "https://*.totaljobs.com/*",
+    "https://*.linkedin.com/*",
+    "https://linkedin.com/*",
+    "http://204.168.194.157:8080/*",
+    "http://204.168.194.157/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ApplyExpress",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.greenhouse.io/*",
+        "https://*.lever.co/*",
+        "https://*.reed.co.uk/*",
+        "https://*.workable.com/*",
+        "https://*.ashbyhq.com/*",
+        "https://*.indeed.co.uk/*",
+        "https://*.indeed.com/*",
+        "https://*.totaljobs.com/*",
+        "https://*.linkedin.com/*",
+        "http://204.168.194.157:8080/*",
+        "http://204.168.194.157/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

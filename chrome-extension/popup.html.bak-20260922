@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoApply</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 380px;
+      min-height: 500px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #1e40af, #7c3aed);
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header h1 {
+      font-size: 16px;
+      font-weight: 700;
+      color: white;
+    }
+
+    .header .subtitle {
+      font-size: 11px;
+      color: rgba(255,255,255,0.7);
+    }
+
+    .logo {
+      width: 32px;
+      height: 32px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+
+    .section {
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e293b;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    /* Status bar */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: #1e293b;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #64748b;
+      flex-shrink: 0;
+    }
+
+    .status-dot.running { background: #22c55e; animation: pulse 1.5s infinite; }
+    .status-dot.idle { background: #64748b; }
+    .status-dot.error { background: #ef4444; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .status-text { font-size: 12px; color: #94a3b8; flex: 1; }
+    .status-count { font-size: 12px; font-weight: 600; color: #e2e8f0; }
+
+    /* Stats */
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      padding: 12px 16px;
+    }
+
+    .stat {
+      background: #1e293b;
+      border-radius: 8px;
+      padding: 8px;
+      text-align: center;
+    }
+
+    .stat-number {
+      font-size: 20px;
+      font-weight: 700;
+      color: white;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .stat-number.green { color: #22c55e; }
+    .stat-number.yellow { color: #f59e0b; }
+    .stat-number.red { color: #ef4444; }
+
+    /* CV upload */
+    .cv-upload {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .cv-name {
+      flex: 1;
+      font-size: 12px;
+      color: #94a3b8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .cv-name.loaded { color: #22c55e; }
+
+    /* Server config */
+    .input-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .input-row label {
+      font-size: 11px;
+      color: #64748b;
+      width: 60px;
+      flex-shrink: 0;
+    }
+
+    input[type="text"], input[type="password"] {
+      flex: 1;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-size: 12px;
+      color: #e2e8f0;
+      outline: none;
+    }
+
+    input[type="text"]:focus, input[type="password"]:focus {
+      border-color: #3b82f6;
+    }
+
+    /* Buttons */
+    .btn {
+      border: none;
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-primary { background: #3b82f6; color: white; }
+    .btn-success { background: #22c55e; color: white; }
+    .btn-danger { background: #ef4444; color: white; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+    .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+    }
+
+    .btn-row .btn { flex: 1; }
+
+    /* Job list */
+    .job-list {
+      max-height: 200px;
+      overflow-y: auto;
+      padding: 0 16px 8px;
+    }
+
+    .job-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 0;
+      border-bottom: 1px solid #1e293b;
+    }
+
+    .job-item:last-child { border-bottom: none; }
+
+    .job-status-icon {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+    }
+
+    .job-status-icon.pending { background: #334155; color: #64748b; }
+    .job-status-icon.current { background: #1d4ed8; color: white; animation: pulse 1s infinite; }
+    .job-status-icon.applied { background: #166534; color: #22c55e; }
+    .job-status-icon.failed { background: #7f1d1d; color: #ef4444; }
+
+    .job-info { flex: 1; overflow: hidden; }
+
+    .job-title {
+      font-size: 12px;
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .job-company {
+      font-size: 10px;
+      color: #64748b;
+    }
+
+    .job-ats {
+      font-size: 10px;
+      color: #3b82f6;
+      background: #1e3a5f;
+      padding: 1px 5px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+
+    /* Log */
+    .log {
+      background: #0a0f1e;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      margin: 0 16px 12px;
+      padding: 8px;
+      height: 70px;
+      overflow-y: auto;
+      font-family: 'Courier New', monospace;
+      font-size: 10px;
+      color: #64748b;
+    }
+
+    .log .log-entry { margin-bottom: 2px; }
+    .log .log-entry.success { color: #22c55e; }
+    .log .log-entry.error { color: #ef4444; }
+    .log .log-entry.info { color: #3b82f6; }
+
+    /* Hidden file input */
+    #cv-file-input { display: none; }
+
+    .empty-state {
+      text-align: center;
+      padding: 20px;
+      color: #475569;
+      font-size: 12px;
+    }
+
+    .delay-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .delay-row input[type="range"] {
+      flex: 1;
+      accent-color: #3b82f6;
+    }
+
+    .delay-value { font-size: 11px; color: #3b82f6; width: 35px; text-align: right; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="logo">🤖</div>
+    <div>
+      <div class="h1">AutoApply</div>
+      <div class="subtitle">Autonomous Job Application Bot</div>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="status-dot idle" id="status-dot"></div>
+    <div class="status-text" id="status-text">Idle — click Fetch Jobs to start</div>
+    <div class="status-count" id="queue-count"></div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-number green" id="stat-applied">0</div>
+      <div class="stat-label">Applied</div>
+    </div>
+    <div class="stat">
+      <div class="stat-number yellow" id="stat-failed">0</div>
+      <div class="stat-label">Needs Review</div>
+    </div>
+    <div class="stat">
+      <div class="stat-number" id="stat-queue">0</div>
+      <div class="stat-label">In Queue</div>
+    </div>
+  </div>
+
+  <!-- Server Config -->
+  <div class="section">
+    <div class="section-title">Server Connection</div>
+    <div class="input-row">
+      <label>Server</label>
+      <input type="text" id="server-url" placeholder="http://100.115.92.204:5001">
+    </div>
+    <div class="input-row">
+      <label>API Key</label>
+      <input type="password" id="api-key" placeholder="autoapply-secret-2024">
+    </div>
+    <div style="display:flex; gap:6px; margin-top:6px;">
+      <button class="btn btn-secondary btn-sm" id="btn-save-config">Save Config</button>
+      <button class="btn btn-secondary btn-sm" id="btn-test-conn">Test Connection</button>
+    </div>
+  </div>
+
+  <!-- CV Upload -->
+  <div class="section">
+    <div class="section-title">CV / Resume</div>
+    <div class="cv-upload">
+      <span class="cv-name" id="cv-name">No CV loaded</span>
+      <button class="btn btn-secondary btn-sm" id="btn-load-cv">Load from Server</button>
+    </div>
+  </div>
+
+  <!-- Delay setting -->
+  <div class="section">
+    <div class="section-title">Apply Delay Between Jobs</div>
+    <div class="delay-row">
+      <input type="range" id="delay-slider" min="3" max="30" value="5">
+      <span class="delay-value" id="delay-value">5s</span>
+    </div>
+  </div>
+
+  <div class="section" style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <div class="section-title" style="margin-bottom:2px">Auto-apply</div>
+      <div style="font-size:11px;color:#64748b">Checks every 15 min &amp; applies automatically</div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <span id="auto-apply-label" style="font-size:12px;color:#94a3b8">On</span>
+      <div style="position:relative;width:40px;height:22px">
+        <input type="checkbox" id="auto-apply-toggle" checked
+          style="opacity:0;width:0;height:0;position:absolute">
+        <div id="auto-apply-track" style="position:absolute;inset:0;border-radius:11px;
+          background:#1a5c34;transition:background .2s;cursor:pointer">
+          <div id="auto-apply-thumb" style="position:absolute;top:3px;left:3px;width:16px;height:16px;
+            border-radius:50%;background:#fff;transition:left .2s;box-shadow:0 1px 3px rgba(0,0,0,.3)">
+          </div>
+        </div>
+      </div>
+    </label>
+  </div>
+
+  <!-- Control buttons -->
+  <div class="btn-row">
+    <button class="btn btn-primary" id="btn-fetch">Fetch Jobs</button>
+    <button class="btn btn-success" id="btn-start" disabled>Start Applying</button>
+    <button class="btn btn-danger" id="btn-stop" disabled>Stop</button>
+  </div>
+
+  <!-- Job queue -->
+  <div class="section">
+    <div class="section-title">Job Queue</div>
+  </div>
+  <div class="job-list" id="job-list">
+    <div class="empty-state">No jobs in queue. Click "Fetch Jobs" to load from Google Sheets.</div>
+  </div>
+
+  <!-- Activity log -->
+  <div class="log" id="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

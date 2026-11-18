@@ -3,7 +3,7 @@
 
 Reed session cookies only survive a few days; once they lapse, every Reed
 apply fails with "Session cookies expired" until someone notices. Cron runs
-this before the first pipeline of the day (05:30 UTC), re-logging each user
+this every 3h from 05:30 UTC (skips users whose session has >8h left), re-logging each user
 in with their stored credentials and rewriting
 data/users/<id>/sessions/reed.json.
 
@@ -41,6 +41,22 @@ def _dec(ciphertext: str) -> str:
         return ""
 
 
+def _session_hours_left(uid: int) -> float:
+    """Hours until the Reed auth cookie expires (<=0 if dead/missing)."""
+    import json, time
+    f = ROOT / "data" / "users" / str(uid) / "sessions" / "reed.json"
+    try:
+        c = json.loads(f.read_text())
+        c = c.get("cookies", c) if isinstance(c, dict) else c
+        exp = [x.get("expires", -1) for x in c
+               if x.get("name") == "auth0.TKbAUxPEADXAXdf27NmYJv0Kg6aDfrdt.is.authenticated"
+               or x.get("name") == "reed.co.ukV10Auth"]
+        exp = [e for e in exp if e and e > 0]
+        return (max(exp) - time.time()) / 3600 if exp else 0
+    except Exception:
+        return 0
+
+
 def main():
     db = sqlite3.connect(str(ROOT / "data" / "autoapply.db"))
     db.row_factory = sqlite3.Row
@@ -65,7 +81,12 @@ def main():
         env = os.environ.copy()
         env.update({"TMP_DIR": str(tmp_dir), "REED_EMAIL": email, "REED_PASSWORD": password})
 
-        log.info(f"user {uid}: refreshing Reed session ({email})")
+        left = _session_hours_left(uid)
+        if left > 8:
+            log.info(f"user {uid}: Reed session still good for {left:.0f}h — skipping")
+            continue
+
+        log.info(f"user {uid}: refreshing Reed session ({email}); session has {left:.0f}h left")
         try:
             r = subprocess.run(
                 ["node", "tools/reed_login_once.js"],

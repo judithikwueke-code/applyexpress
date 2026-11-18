@@ -43,6 +43,12 @@ users = db.execute(
     (datetime.utcnow().isoformat(),)
 ).fetchall()
 
+# Skip users with no CV uploaded (they just generate hundreds of failed "CV tailor error" rows)
+_no_cv = [u["id"] for u in users if not (ROOT / "data" / "users" / str(u["id"]) / "cv.docx").exists()]
+if _no_cv:
+    log.warning(f"Skipping user(s) with no cv.docx: {_no_cv}")
+    users = [u for u in users if u["id"] not in _no_cv]
+
 log.info(f"Firing pipeline for {len(users)} active (paid/trial) user(s) in parallel")
 
 seq_runner = ROOT / "tools" / "run_sequential_runner.py"
